@@ -16,13 +16,12 @@ Este projeto implementa uma rede peer-to-peer (P2P) com compartilhamento de arqu
 
 ```bash
 pip install -r requirements.txt
-
-
 ```
-Execute o primeiro peer:
-```commandline
-python p2p.py 5000
-or
+2. Execute o peer:
+```bash
+python p2p.py 5000  
+#if you are using python3   
 python3 p2p.py 5000
 ```
+
 
