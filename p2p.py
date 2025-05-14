@@ -131,6 +131,7 @@ def connect_to_peer(ip, port):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso: python p2p.py <porta>")
+        print("Porta Recomendada:5000")
         sys.exit(1)
 
     PORTA_LOCAL = int(sys.argv[1])
