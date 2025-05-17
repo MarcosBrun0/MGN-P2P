@@ -22,7 +22,7 @@ MAX_ARQUIVO_MEMORIA = 100 * 1024 * 1024  # 100 MB em memória
 CHUNK_SIZE = 8192  # 8KB por chunk
 NOME_PASTA = "shared_folder"
 PASTA = os.path.normpath(os.path.join(os.getcwd(), NOME_PASTA))
-DISCOVERY_SERVER = "stun4.l.google.com"  # Servidor STUN público
+DISCOVERY_SERVER = "stun.l.google.com"  # Servidor STUN público
 DISCOVERY_PORT = 19302
 RETRY_INTERVAL = 5  # Segundos entre tentativas de hole punching
 MAX_PACKET_SIZE = 65507  # Tamanho máximo de pacote UDP
@@ -39,6 +39,18 @@ local_ext_addr = None  # Endereço externo (público) local
 transfer_queues = {}  # addr -> Queue
 transfer_threads = {}  # addr -> Thread
 running = True
+
+# Log da pasta de compartilhamento
+print(f"[INFO] Pasta de compartilhamento: {PASTA}")
+# Garante que a pasta existe
+if not os.path.exists(PASTA):
+    try:
+        os.makedirs(PASTA)
+        print(f"[CRIADO] Pasta '{NOME_PASTA}' criada em: {PASTA}")
+    except Exception as e:
+        print(f"[ERRO] Não foi possível criar a pasta: {str(e)}")
+else:
+    print(f"[EXISTE] Pasta encontrada: {PASTA}")
 
 class PeerInfo:
     def __init__(self, addr, ext_addr=None, last_seen=None):
@@ -86,6 +98,37 @@ def calcular_hash(dados):
     Calcula o hash MD5 de dados em memória
     """
     return hashlib.md5(dados).hexdigest()
+
+def limpar_peers_inativos():
+    """
+    Remove peers inativos da lista global
+    """
+    global peers
+    agora = time.time()
+    
+    for addr in list(peers.keys()):
+        if agora - peers[addr].last_seen > 300:  # 5 minutos
+            print(f"[LIMPEZA] Peer {addr} removido por inatividade")
+            peers[addr].active = False
+            if addr in transfer_queues:
+                del transfer_queues[addr]
+            if addr in transfer_threads:
+                if transfer_threads[addr].is_alive():
+                    # Sinalizar para a thread parar
+                    pass
+                del transfer_threads[addr]
+            del peers[addr]
+    
+    print(f"[LIMPEZA] {len(peers)} peers ativos após limpeza")
+
+def iniciar_limpeza_periodica():
+    """
+    Inicia thread para limpeza periódica de peers inativos
+    """
+    global running
+    while running:
+        time.sleep(60)  # Verifica a cada minuto
+        limpar_peers_inativos()
 
 def get_external_ip():
     """
@@ -386,8 +429,8 @@ def processar_pacote(dados, addr):
                 nome_arquivo = conteudo.decode()
                 print(f"[FIM TRANSFERÊNCIA] Arquivo '{nome_arquivo}' transferido com sucesso")
                 
-                # Aqui você pode implementar lógica para verificar se todos os chunks foram recebidos
-                
+                print(f"[DEBUG] Arquivo salvo em: {caminho_arquivo}")
+                print(f"[DEBUG] Tamanho do arquivo: {os.path.getsize(caminho_arquivo)}")                
             except Exception as e:
                 print(f"[ERRO] Falha ao processar fim de transferência: {e}")
                 
@@ -432,42 +475,61 @@ def processar_transferencia(addr):
                     
                     # Verifica se recebemos todos os chunks
                     if len(transfer_info.chunks_recebidos) == transfer_info.total_chunks:
-                        # Verifica integridade
-                        hash_calculado = calcular_hash(transfer_info.buffer)
-                        if hash_calculado == transfer_info.hash:
-                            # Salva arquivo
-                            caminho_arquivo = os.path.join(PASTA, transfer_info.nome_arquivo)
-                            with open(caminho_arquivo, "wb") as f:
-                                f.write(transfer_info.buffer)
-                            print(f"[RECEBIDO] Arquivo '{transfer_info.nome_arquivo}' verificado e salvo.")
+                        try:
+                            # Verifica integridade
+                            hash_calculado = calcular_hash(transfer_info.buffer)
+                            print(f"[DEBUG] Hash calculado: {hash_calculado}")
+                            print(f"[DEBUG] Hash esperado: {transfer_info.hash}")
                             
-                            # Atualiza informações locais
-                            arquivos_info[transfer_info.nome_arquivo] = ArquivoInfo(
-                                transfer_info.nome_arquivo, 
-                                transfer_info.timestamp, 
-                                transfer_info.hash, 
-                                transfer_info.tamanho
-                            )
-                            
-                            # Registra o hash como recentemente recebido
-                            arquivos_recentes[transfer_info.hash] = time.time()
-                            
-                            # Publica na DHT
-                            executar_na_dht(publicar_arquivo_na_dht(
-                                transfer_info.nome_arquivo, 
-                                transfer_info.timestamp, 
-                                transfer_info.hash
-                            ))
-                            
-                            # Propaga para outros peers (protocolo gossip)
-                            propagar_arquivo(transfer_info.nome_arquivo, caminho_arquivo, addr)
-                            
+                            if hash_calculado == transfer_info.hash:
+                                # Garante que a pasta existe
+                                if not os.path.exists(PASTA):
+                                    os.makedirs(PASTA)
+                                    print(f"[DEBUG] Criando pasta: {PASTA}")
+                                
+                                # Salva arquivo com caminho absoluto
+                                caminho_arquivo = os.path.normpath(os.path.join(PASTA, transfer_info.nome_arquivo))
+                                print(f"[DEBUG] Salvando em: {caminho_arquivo}")
+                                
+                                # Tenta salvar o arquivo
+                                with open(caminho_arquivo, "wb") as f:
+                                    f.write(transfer_info.buffer)
+                                
+                                # Verifica se o arquivo foi salvo
+                                if os.path.exists(caminho_arquivo):
+                                    tamanho = os.path.getsize(caminho_arquivo)
+                                    print(f"[RECEBIDO] Arquivo '{transfer_info.nome_arquivo}' verificado e salvo ({tamanho} bytes).")
+                                    
+                                    # Atualiza informações locais
+                                    arquivos_info[transfer_info.nome_arquivo] = ArquivoInfo(
+                                        transfer_info.nome_arquivo, 
+                                        transfer_info.timestamp, 
+                                        transfer_info.hash, 
+                                        transfer_info.tamanho
+                                    )
+                                    
+                                    # Registra o hash como recentemente recebido
+                                    arquivos_recentes[transfer_info.hash] = time.time()
+                                    
+                                    # Publica na DHT
+                                    executar_na_dht(publicar_arquivo_na_dht(
+                                        transfer_info.nome_arquivo, 
+                                        transfer_info.timestamp, 
+                                        transfer_info.hash
+                                    ))
+                                    
+                                    # Propaga para outros peers (protocolo gossip)
+                                    propagar_arquivo(transfer_info.nome_arquivo, caminho_arquivo, addr)
+                                else:
+                                    print(f"[ERRO] Falha ao salvar arquivo: {caminho_arquivo} não existe após gravação")
+                            else:
+                                print(f"[ERRO] Verificação falhou para '{transfer_info.nome_arquivo}'")
+                                print(f"Hash esperado: {transfer_info.hash}")
+                                print(f"Hash calculado: {hash_calculado}")
+                        except Exception as e:
+                            print(f"[ERRO] Exceção ao salvar arquivo: {str(e)}")
+                        finally:
                             # Limpa a transferência
-                            transfer_info = None
-                        else:
-                            print(f"[ERRO] Verificação falhou para '{transfer_info.nome_arquivo}'")
-                            print(f"Hash esperado: {transfer_info.hash}")
-                            print(f"Hash calculado: {hash_calculado}")
                             transfer_info = None
             
             transfer_queues[addr].task_done()
@@ -650,18 +712,25 @@ def listar_arquivos_locais():
     Retorna uma lista de arquivos na pasta compartilhada
     """
     arquivos = []
-    for nome_arquivo in os.listdir(PASTA):
-        caminho = os.path.join(PASTA, nome_arquivo)
-        if os.path.isfile(caminho):
-            tamanho = os.path.getsize(caminho)
-            timestamp = os.path.getmtime(caminho)
-            hash_valor = calcular_hash_arquivo(caminho)
-            arquivos.append({
-                "nome": nome_arquivo,
-                "tamanho": tamanho,
-                "timestamp": timestamp,
-                "hash": hash_valor
-            })
+    try:
+        if not os.path.exists(PASTA):
+            os.makedirs(PASTA)
+            print(f"[CRIADO] Pasta '{NOME_PASTA}' criada em: {PASTA}")
+            
+        for nome_arquivo in os.listdir(PASTA):
+            caminho = os.path.join(PASTA, nome_arquivo)
+            if os.path.isfile(caminho):
+                tamanho = os.path.getsize(caminho)
+                timestamp = os.path.getmtime(caminho)
+                hash_valor = calcular_hash_arquivo(caminho)
+                arquivos.append({
+                    "nome": nome_arquivo,
+                    "tamanho": tamanho,
+                    "timestamp": timestamp,
+                    "hash": hash_valor
+                })
+    except Exception as e:
+        print(f"[ERRO] Falha ao listar arquivos locais: {e}")
     return arquivos
 
 def solicitar_lista_arquivos(addr):
@@ -800,9 +869,13 @@ if __name__ == "__main__":
 
     PORTA_LOCAL = int(sys.argv[1])
 
+    # Garante que a pasta existe
     if not os.path.exists(PASTA):
-        os.makedirs(PASTA)
-        print(f"[CRIADO] Pasta '{NOME_PASTA}' criada em: {PASTA}")
+        try:
+            os.makedirs(PASTA)
+            print(f"[CRIADO] Pasta '{NOME_PASTA}' criada em: {PASTA}")
+        except Exception as e:
+            print(f"[ERRO] Não foi possível criar a pasta: {str(e)}")
     else:
         print(f"[EXISTE] Pasta encontrada: {PASTA}")
 
@@ -820,6 +893,9 @@ if __name__ == "__main__":
     # Inicia thread para receber pacotes
     recv_thread = threading.Thread(target=receber_pacotes, daemon=True)
     recv_thread.start()
+    
+    # Inicia thread para limpeza periódica de peers
+    threading.Thread(target=iniciar_limpeza_periodica, daemon=True).start()
     
     # Inicia thread para manter conexões ativas
     threading.Thread(target=manter_conexoes_ativas, daemon=True).start()
