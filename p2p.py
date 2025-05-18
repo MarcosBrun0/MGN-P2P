@@ -39,9 +39,15 @@ local_ext_addr = None  # Endereço externo (público) local
 transfer_queues = {}  # addr -> Queue
 transfer_threads = {}  # addr -> Thread
 running = True
+# CORREÇÃO: Dicionário para armazenar transferências em andamento
+transferencias_ativas = {}  # nome_arquivo -> TransferInfo
+# CORREÇÃO: Contador de pacotes para depuração
+contador_pacotes = {"enviados": 0, "recebidos": 0, "chunks": 0}
+# CORREÇÃO: Versão do protocolo para verificação
+PROTOCOLO_VERSAO = 1
 
 # Log da pasta de compartilhamento
-print(f"[INFO] Pasta de compartilhamento: {PASTA}")
+print(f"[DEBUG] Pasta compartilhada: {PASTA}")
 # Garante que a pasta existe
 if not os.path.exists(PASTA):
     try:
@@ -184,6 +190,9 @@ def enviar_pacote(addr, tipo, dados):
         header = struct.pack('!H', tipo)
         pacote = header + dados
         udp_socket.sendto(pacote, addr)
+        contador_pacotes["enviados"] += 1
+        if tipo == 16:  # Chunk
+            contador_pacotes["chunks"] += 1
         return True
     except Exception as e:
         print(f"[ERRO ENVIO] {e}")
@@ -240,6 +249,9 @@ def processar_pacote(dados, addr):
         
         tipo = struct.unpack('!H', dados[:2])[0]
         conteudo = dados[2:]
+        
+        # CORREÇÃO: Incrementa contador de pacotes recebidos
+        contador_pacotes["recebidos"] += 1
         
         # Atualiza ou adiciona o peer
         if addr not in peers:
@@ -349,19 +361,9 @@ def processar_pacote(dados, addr):
                         enviar_pacote(addr, 14, f"Arquivo duplicado com hash {hash_valor}".encode())
                         return
                 
-                # Cria estrutura para receber o arquivo
-                if addr not in transfer_queues:
-                    transfer_queues[addr] = queue.Queue()
-                    transfer_threads[addr] = threading.Thread(
-                        target=processar_transferencia,
-                        args=(addr,),
-                        daemon=True
-                    )
-                    transfer_threads[addr].start()
-                
-                # Adiciona informações de transferência à fila
+                # CORREÇÃO: Cria estrutura para receber o arquivo diretamente
                 transfer_info = TransferInfo(nome_arquivo, tamanho, hash_valor, timestamp, total_chunks)
-                transfer_queues[addr].put(('INIT', transfer_info))
+                transferencias_ativas[nome_arquivo] = transfer_info
                 
                 # Envia ACK
                 enviar_pacote(addr, 15, nome_arquivo.encode())  # Tipo 15: ACK
@@ -386,160 +388,259 @@ def processar_pacote(dados, addr):
                 print(f"[ACK] Recebido")
                 
         elif tipo == 16:  # Chunk de Arquivo
-            # Processa chunk de arquivo
+            # CORREÇÃO: Incrementa contador de chunks recebidos
+            contador_pacotes["chunks"] += 1
+            
+            # CORREÇÃO: Novo formato de cabeçalho de chunk
+            # [versão:1][nome_len:2][chunk_idx:4][chunk_size:4][nome][dados]
             try:
-                if len(conteudo) < 12:
+                if len(conteudo) < 11:  # 1 + 2 + 4 + 4 = 11 bytes mínimos para o cabeçalho
+                    print(f"[ERRO CHUNK] Cabeçalho muito pequeno: {len(conteudo)} bytes")
                     return
                 
-                nome_arquivo_len = struct.unpack('!H', conteudo[:2])[0]
-                nome_arquivo = conteudo[2:2+nome_arquivo_len].decode()
-                chunk_idx = struct.unpack('!I', conteudo[2+nome_arquivo_len:6+nome_arquivo_len])[0]
-                chunk_size = struct.unpack('!I', conteudo[6+nome_arquivo_len:10+nome_arquivo_len])[0]
-                chunk_data = conteudo[10+nome_arquivo_len:10+nome_arquivo_len+chunk_size]
+                # Extrai a versão do protocolo
+                versao = conteudo[0]
+                if versao != PROTOCOLO_VERSAO:
+                    print(f"[ERRO CHUNK] Versão do protocolo incompatível: {versao}")
+                    return
                 
-                # Adiciona chunk à fila de processamento
-                if addr in transfer_queues:
-                    transfer_queues[addr].put(('CHUNK', (nome_arquivo, chunk_idx, chunk_data)))
+                # Extrai o tamanho do nome do arquivo
+                nome_len = struct.unpack('!H', conteudo[1:3])[0]
+                if nome_len <= 0 or nome_len > 255:  # Limite razoável para nome de arquivo
+                    print(f"[ERRO CHUNK] Tamanho de nome inválido: {nome_len}")
+                    return
+                
+                # Extrai o índice do chunk
+                chunk_idx = struct.unpack('!I', conteudo[3:7])[0]
+                if chunk_idx > 1000000:  # Limite razoável para número de chunks
+                    print(f"[ERRO CHUNK] Índice de chunk inválido: {chunk_idx}")
+                    return
+                
+                # Extrai o tamanho do chunk
+                chunk_size = struct.unpack('!I', conteudo[7:11])[0]
+                if chunk_size <= 0 or chunk_size > CHUNK_SIZE * 2:  # Limite razoável para tamanho de chunk
+                    print(f"[ERRO CHUNK] Tamanho de chunk inválido: {chunk_size}")
+                    return
+                
+                # Verifica se há dados suficientes para o nome e o chunk
+                if len(conteudo) < 11 + nome_len + chunk_size:
+                    print(f"[ERRO CHUNK] Dados insuficientes: esperado {11 + nome_len + chunk_size}, recebido {len(conteudo)}")
+                    return
+                
+                # Extrai o nome do arquivo
+                nome_arquivo = conteudo[11:11+nome_len].decode('utf-8', errors='replace')
+                
+                # Extrai os dados do chunk
+                chunk_data = conteudo[11+nome_len:11+nome_len+chunk_size]
+                
+                print(f"[CHUNK RECEBIDO] {nome_arquivo} chunk {chunk_idx} ({len(chunk_data)} bytes)")
+                
+                # Processa o chunk
+                if nome_arquivo in transferencias_ativas:
+                    transfer_info = transferencias_ativas[nome_arquivo]
                     
-                    # Envia ACK para o chunk
-                    ack_data = struct.pack('!HI', len(nome_arquivo.encode()), chunk_idx) + nome_arquivo.encode()
-                    enviar_pacote(addr, 17, ack_data)  # Tipo 17: Chunk ACK
+                    # Verifica se este chunk já foi recebido
+                    if chunk_idx in transfer_info.chunks_recebidos:
+                        print(f"[CHUNK DUPLICADO] {nome_arquivo} chunk {chunk_idx}")
+                        return
+                    
+                    # Verifica se o índice do chunk é válido
+                    if chunk_idx >= transfer_info.total_chunks:
+                        print(f"[ERRO CHUNK] Índice de chunk fora do intervalo: {chunk_idx} >= {transfer_info.total_chunks}")
+                        return
+                        
+                    # Calcula a posição no buffer
+                    offset = chunk_idx * CHUNK_SIZE
+                    if offset + len(chunk_data) <= transfer_info.tamanho:
+                        transfer_info.buffer[offset:offset+len(chunk_data)] = chunk_data
+                        transfer_info.chunks_recebidos.add(chunk_idx)
+                        print(f"[CHUNK PROCESSADO] {nome_arquivo} chunk {chunk_idx}, total: {len(transfer_info.chunks_recebidos)}/{transfer_info.total_chunks}")
+                        
+                        # Envia ACK para o chunk
+                        ack_data = struct.pack('!BHI', PROTOCOLO_VERSAO, len(nome_arquivo.encode()), chunk_idx) + nome_arquivo.encode()
+                        enviar_pacote(addr, 17, ack_data)  # Tipo 17: Chunk ACK
+                        
+                        # Verifica se recebemos todos os chunks
+                        if len(transfer_info.chunks_recebidos) == transfer_info.total_chunks:
+                            print(f"[TODOS CHUNKS RECEBIDOS] {nome_arquivo}, iniciando salvamento")
+                            try:
+                                # Verifica integridade
+                                hash_calculado = calcular_hash(transfer_info.buffer)
+                                print(f"[DEBUG] Hash calculado: {hash_calculado}")
+                                print(f"[DEBUG] Hash esperado: {transfer_info.hash}")
+                                
+                                if hash_calculado == transfer_info.hash:
+                                    # Garante que a pasta existe
+                                    os.makedirs(PASTA, exist_ok=True)
+                                    
+                                    # Salva o arquivo
+                                    caminho_arquivo = os.path.join(PASTA, transfer_info.nome_arquivo)
+                                    print(f"[DEBUG] Salvando arquivo em: {caminho_arquivo}")
+                                    
+                                    try:
+                                        with open(caminho_arquivo, "wb") as f:
+                                            f.write(transfer_info.buffer)
+                                            f.flush()
+                                            os.fsync(f.fileno())  # Força escrita no disco
+                                        
+                                        print(f"[DEBUG] Arquivo salvo, verificando existência: {os.path.exists(caminho_arquivo)}")
+                                        
+                                        if os.path.exists(caminho_arquivo):
+                                            tamanho = os.path.getsize(caminho_arquivo)
+                                            print(f"[RECEBIDO] Arquivo '{transfer_info.nome_arquivo}' verificado e salvo ({tamanho} bytes).")
+                                            
+                                            # Atualiza informações locais
+                                            arquivos_info[transfer_info.nome_arquivo] = ArquivoInfo(
+                                                transfer_info.nome_arquivo, 
+                                                transfer_info.timestamp, 
+                                                transfer_info.hash, 
+                                                transfer_info.tamanho
+                                            )
+                                            
+                                            # Registra o hash como recentemente recebido
+                                            arquivos_recentes[transfer_info.hash] = time.time()
+                                            
+                                            # Publica na DHT
+                                            executar_na_dht(publicar_arquivo_na_dht(
+                                                transfer_info.nome_arquivo, 
+                                                transfer_info.timestamp, 
+                                                transfer_info.hash
+                                            ))
+                                        else:
+                                            print(f"[ERRO] Falha ao salvar arquivo: {caminho_arquivo} não existe após gravação")
+                                            
+                                            # Tenta salvar em um local alternativo
+                                            alt_path = os.path.join(os.getcwd(), transfer_info.nome_arquivo)
+                                            print(f"[CORREÇÃO] Tentando salvar em local alternativo: {alt_path}")
+                                            with open(alt_path, "wb") as f:
+                                                f.write(transfer_info.buffer)
+                                                f.flush()
+                                                os.fsync(f.fileno())
+                                            print(f"[CORREÇÃO] Arquivo salvo em local alternativo: {os.path.exists(alt_path)}")
+                                    except Exception as e:
+                                        print(f"[ERRO ESCRITA] Detalhes: {str(e)}")
+                                        import traceback
+                                        traceback.print_exc()
+                                else:
+                                    print(f"[ERRO] Verificação falhou para '{transfer_info.nome_arquivo}'")
+                                    print(f"Hash esperado: {transfer_info.hash}")
+                                    print(f"Hash calculado: {hash_calculado}")
+                            except Exception as e:
+                                print(f"[ERRO] Exceção ao salvar arquivo: {str(e)}")
+                                import traceback
+                                traceback.print_exc()
+                            finally:
+                                # Limpa a transferência
+                                del transferencias_ativas[nome_arquivo]
+                    else:
+                        print(f"[ERRO CHUNK] Offset inválido: {offset} + {len(chunk_data)} > {transfer_info.tamanho}")
+                else:
+                    print(f"[ERRO CHUNK] Arquivo não encontrado nas transferências ativas: {nome_arquivo}")
                 
             except Exception as e:
                 print(f"[ERRO] Falha ao processar chunk: {e}")
+                import traceback
+                traceback.print_exc()
                 
         elif tipo == 17:  # Chunk ACK
             # Processa confirmação de chunk
             try:
-                nome_arquivo_len = struct.unpack('!H', conteudo[:2])[0]
-                chunk_idx = struct.unpack('!I', conteudo[2:6])[0]
-                nome_arquivo = conteudo[6:6+nome_arquivo_len].decode()
+                # CORREÇÃO: Novo formato de ACK de chunk
+                # [versão:1][nome_len:2][chunk_idx:4][nome]
+                if len(conteudo) < 7:  # 1 + 2 + 4 = 7 bytes mínimos para o cabeçalho
+                    print(f"[ERRO ACK] Cabeçalho muito pequeno: {len(conteudo)} bytes")
+                    return
+                
+                # Extrai a versão do protocolo
+                versao = conteudo[0]
+                if versao != PROTOCOLO_VERSAO:
+                    print(f"[ERRO ACK] Versão do protocolo incompatível: {versao}")
+                    return
+                
+                # Extrai o tamanho do nome do arquivo
+                nome_len = struct.unpack('!H', conteudo[1:3])[0]
+                if nome_len <= 0 or nome_len > 255:  # Limite razoável para nome de arquivo
+                    print(f"[ERRO ACK] Tamanho de nome inválido: {nome_len}")
+                    return
+                
+                # Extrai o índice do chunk
+                chunk_idx = struct.unpack('!I', conteudo[3:7])[0]
+                
+                # Verifica se há dados suficientes para o nome
+                if len(conteudo) < 7 + nome_len:
+                    print(f"[ERRO ACK] Dados insuficientes: esperado {7 + nome_len}, recebido {len(conteudo)}")
+                    return
+                
+                # Extrai o nome do arquivo
+                nome_arquivo = conteudo[7:7+nome_len].decode('utf-8', errors='replace')
                 
                 print(f"[CHUNK ACK] {nome_arquivo} chunk {chunk_idx}")
-                
-                # Aqui você pode implementar lógica para reenvio de chunks perdidos
-                # ou para controle de fluxo
                 
             except Exception as e:
                 print(f"[ERRO] Falha ao processar ACK de chunk: {e}")
                 
         elif tipo == 18:  # Fim de Transferência
-            # Processa fim de transferência
             try:
                 nome_arquivo = conteudo.decode()
                 print(f"[FIM TRANSFERÊNCIA] Arquivo '{nome_arquivo}' transferido com sucesso")
+                print(f"[ESTATÍSTICAS] Pacotes enviados: {contador_pacotes['enviados']}, recebidos: {contador_pacotes['recebidos']}, chunks: {contador_pacotes['chunks']}")
                 
-                print(f"[DEBUG] Arquivo salvo em: {caminho_arquivo}")
-                print(f"[DEBUG] Tamanho do arquivo: {os.path.getsize(caminho_arquivo)}")                
+                # Verificar se o arquivo foi salvo
+                print("[DEBUG] Verificando se o arquivo foi salvo...")
+                caminho_arquivo = os.path.join(PASTA, nome_arquivo)
+                
+                if os.path.exists(caminho_arquivo):
+                    print(f"[DEBUG] Arquivo encontrado em: {caminho_arquivo}")
+                    print(f"[DEBUG] Tamanho: {os.path.getsize(caminho_arquivo)} bytes")
+                else:
+                    print(f"[DEBUG] Arquivo NÃO encontrado em: {caminho_arquivo}")
+                    print(f"[DEBUG] Pasta existe? {os.path.exists(PASTA)}")
+                    print(f"[DEBUG] Conteúdo da pasta: {os.listdir(PASTA) if os.path.exists(PASTA) else 'Pasta não existe'}")
+                    
+                    # Verifica se temos o arquivo em buffer e tenta salvar novamente
+                    if nome_arquivo in transferencias_ativas:
+                        transfer_info = transferencias_ativas[nome_arquivo]
+                        print(f"[DEBUG] Transferência ativa encontrada: chunks recebidos {len(transfer_info.chunks_recebidos)}/{transfer_info.total_chunks}")
+                        
+                        if len(transfer_info.chunks_recebidos) == transfer_info.total_chunks:
+                            print(f"[CORREÇÃO] Encontrado buffer completo para '{nome_arquivo}', tentando salvar novamente")
+                            try:
+                                # Garante que a pasta existe
+                                os.makedirs(PASTA, exist_ok=True)
+                                
+                                # Tenta salvar o arquivo novamente
+                                with open(caminho_arquivo, "wb") as f:
+                                    f.write(transfer_info.buffer)
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                
+                                print(f"[CORREÇÃO] Arquivo salvo com sucesso: {os.path.exists(caminho_arquivo)}")
+                            except Exception as e:
+                                print(f"[ERRO CORREÇÃO] Falha ao tentar salvar novamente: {str(e)}")
+                                
+                                # Tenta salvar em um local alternativo
+                                alt_path = os.path.join(os.getcwd(), nome_arquivo)
+                                print(f"[CORREÇÃO] Tentando salvar em local alternativo: {alt_path}")
+                                with open(alt_path, "wb") as f:
+                                    f.write(transfer_info.buffer)
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                print(f"[CORREÇÃO] Arquivo salvo em local alternativo: {os.path.exists(alt_path)}")
+                        else:
+                            print(f"[ERRO] Buffer incompleto: {len(transfer_info.chunks_recebidos)}/{transfer_info.total_chunks} chunks recebidos")
+                            print(f"[ERRO] Chunks faltando: {set(range(transfer_info.total_chunks)) - transfer_info.chunks_recebidos}")
+                    else:
+                        print(f"[ERRO] Transferência não encontrada para '{nome_arquivo}'")
+                
             except Exception as e:
                 print(f"[ERRO] Falha ao processar fim de transferência: {e}")
+                import traceback
+                traceback.print_exc()
                 
     except Exception as e:
         print(f"[ERRO] Falha ao processar pacote: {e}")
-
-def processar_transferencia(addr):
-    """
-    Processa a fila de transferência para um peer
-    """
-    transfer_info = None
-    
-    while running:
-        try:
-            if addr not in transfer_queues:
-                break
-                
-            item = transfer_queues[addr].get(timeout=1)
-            if not item:
-                continue
-                
-            tipo, dados = item
-            
-            if tipo == 'INIT':
-                transfer_info = dados
-                
-            elif tipo == 'CHUNK' and transfer_info:
-                nome_arquivo, chunk_idx, chunk_data = dados
-                
-                if nome_arquivo != transfer_info.nome_arquivo:
-                    continue
-                    
-                # Verifica se este chunk já foi recebido
-                if chunk_idx in transfer_info.chunks_recebidos:
-                    continue
-                    
-                # Calcula a posição no buffer
-                offset = chunk_idx * CHUNK_SIZE
-                if offset + len(chunk_data) <= transfer_info.tamanho:
-                    transfer_info.buffer[offset:offset+len(chunk_data)] = chunk_data
-                    transfer_info.chunks_recebidos.add(chunk_idx)
-                    
-                    # Verifica se recebemos todos os chunks
-                    if len(transfer_info.chunks_recebidos) == transfer_info.total_chunks:
-                        try:
-                            # Verifica integridade
-                            hash_calculado = calcular_hash(transfer_info.buffer)
-                            print(f"[DEBUG] Hash calculado: {hash_calculado}")
-                            print(f"[DEBUG] Hash esperado: {transfer_info.hash}")
-                            
-                            if hash_calculado == transfer_info.hash:
-                                # Garante que a pasta existe
-                                if not os.path.exists(PASTA):
-                                    os.makedirs(PASTA)
-                                    print(f"[DEBUG] Criando pasta: {PASTA}")
-                                
-                                # Salva arquivo com caminho absoluto
-                                caminho_arquivo = os.path.normpath(os.path.join(PASTA, transfer_info.nome_arquivo))
-                                print(f"[DEBUG] Salvando em: {caminho_arquivo}")
-                                
-                                # Tenta salvar o arquivo
-                                with open(caminho_arquivo, "wb") as f:
-                                    f.write(transfer_info.buffer)
-                                
-                                # Verifica se o arquivo foi salvo
-                                if os.path.exists(caminho_arquivo):
-                                    tamanho = os.path.getsize(caminho_arquivo)
-                                    print(f"[RECEBIDO] Arquivo '{transfer_info.nome_arquivo}' verificado e salvo ({tamanho} bytes).")
-                                    
-                                    # Atualiza informações locais
-                                    arquivos_info[transfer_info.nome_arquivo] = ArquivoInfo(
-                                        transfer_info.nome_arquivo, 
-                                        transfer_info.timestamp, 
-                                        transfer_info.hash, 
-                                        transfer_info.tamanho
-                                    )
-                                    
-                                    # Registra o hash como recentemente recebido
-                                    arquivos_recentes[transfer_info.hash] = time.time()
-                                    
-                                    # Publica na DHT
-                                    executar_na_dht(publicar_arquivo_na_dht(
-                                        transfer_info.nome_arquivo, 
-                                        transfer_info.timestamp, 
-                                        transfer_info.hash
-                                    ))
-                                    
-                                    # Propaga para outros peers (protocolo gossip)
-                                    propagar_arquivo(transfer_info.nome_arquivo, caminho_arquivo, addr)
-                                else:
-                                    print(f"[ERRO] Falha ao salvar arquivo: {caminho_arquivo} não existe após gravação")
-                            else:
-                                print(f"[ERRO] Verificação falhou para '{transfer_info.nome_arquivo}'")
-                                print(f"Hash esperado: {transfer_info.hash}")
-                                print(f"Hash calculado: {hash_calculado}")
-                        except Exception as e:
-                            print(f"[ERRO] Exceção ao salvar arquivo: {str(e)}")
-                        finally:
-                            # Limpa a transferência
-                            transfer_info = None
-            
-            transfer_queues[addr].task_done()
-            
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[ERRO] Falha no processamento de transferência: {e}")
-            if transfer_info:
-                transfer_info = None
+        import traceback
+        traceback.print_exc()
 
 def receber_pacotes():
     """
@@ -550,7 +651,8 @@ def receber_pacotes():
     while running:
         try:
             dados, addr = udp_socket.recvfrom(MAX_PACKET_SIZE)
-            thread_pool.submit(processar_pacote, dados, addr)
+            # Processa pacotes diretamente em vez de usar thread pool
+            processar_pacote(dados, addr)
         except Exception as e:
             print(f"[ERRO RECEPÇÃO] {e}")
 
@@ -576,6 +678,9 @@ def iniciar_envio_arquivo(addr, nome_arquivo, caminho):
         }
         
         enviar_pacote(addr, 13, json.dumps(info).encode())  # Tipo 13: Início de Transferência
+        
+        # Aguarda um pouco para garantir que o receptor processou o início
+        time.sleep(0.5)
         
         # Inicia thread para envio de chunks
         thread = threading.Thread(
@@ -604,19 +709,27 @@ def enviar_chunks_arquivo(addr, nome_arquivo, caminho, total_chunks):
                 f.seek(i * CHUNK_SIZE)
                 chunk_data = f.read(CHUNK_SIZE)
                 
-                # Prepara o cabeçalho do chunk
-                header = struct.pack('!HII', nome_len, i, len(chunk_data))
+                # CORREÇÃO: Novo formato de cabeçalho de chunk
+                # [versão:1][nome_len:2][chunk_idx:4][chunk_size:4][nome][dados]
+                header = struct.pack('!BHI', PROTOCOLO_VERSAO, nome_len, i) + struct.pack('!I', len(chunk_data))
+                
+                # Imprime informações detalhadas sobre o chunk
+                print(f"[ENVIANDO CHUNK] {nome_arquivo} chunk {i} ({len(chunk_data)} bytes)")
                 
                 # Envia o chunk
                 enviar_pacote(addr, 16, header + nome_bytes + chunk_data)  # Tipo 16: Chunk de Arquivo
                 
-                # Espera um pouco para controle de fluxo
-                time.sleep(0.01)
+                # Espera um pouco mais entre chunks para evitar sobrecarga
+                time.sleep(0.05)
+        
+        # Aguarda um pouco antes de enviar a mensagem de fim
+        time.sleep(0.5)
         
         # Envia mensagem de fim de transferência
         enviar_pacote(addr, 18, nome_arquivo.encode())  # Tipo 18: Fim de Transferência
         
         print(f"[ENVIADO] '{nome_arquivo}' enviado com sucesso")
+        print(f"[ESTATÍSTICAS] Pacotes enviados: {contador_pacotes['enviados']}, chunks: {contador_pacotes['chunks']}")
         
         # Atualiza informações locais
         tamanho = os.path.getsize(caminho)
@@ -630,6 +743,8 @@ def enviar_chunks_arquivo(addr, nome_arquivo, caminho, total_chunks):
         return True
     except Exception as e:
         print(f"[ERRO] Falha ao enviar chunks de '{nome_arquivo}': {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def propagar_arquivo(nome_arquivo, caminho, origem=None):
@@ -713,9 +828,9 @@ def listar_arquivos_locais():
     """
     arquivos = []
     try:
-        if not os.path.exists(PASTA):
-            os.makedirs(PASTA)
-            print(f"[CRIADO] Pasta '{NOME_PASTA}' criada em: {PASTA}")
+        # Garante que a pasta existe com exist_ok=True
+        os.makedirs(PASTA, exist_ok=True)
+        print(f"[DEBUG] Verificando pasta para listagem: {PASTA}, existe: {os.path.exists(PASTA)}")
             
         for nome_arquivo in os.listdir(PASTA):
             caminho = os.path.join(PASTA, nome_arquivo)
@@ -749,6 +864,11 @@ def solicitar_arquivo(addr, nome_arquivo):
     Solicita um arquivo específico de um peer
     """
     try:
+        # Reseta contadores de pacotes
+        contador_pacotes["enviados"] = 0
+        contador_pacotes["recebidos"] = 0
+        contador_pacotes["chunks"] = 0
+        
         enviar_pacote(addr, 12, nome_arquivo.encode())  # Tipo 12: Solicitar Arquivo
         return True
     except Exception as e:
@@ -861,6 +981,22 @@ def connect_to_peer(ip, porta):
         print(f"[ERRO] Não foi possível conectar: {e}")
         return False
 
+def testar_conexao_udp(ip, porta):
+    """
+    Testa a conexão UDP com um peer
+    """
+    try:
+        addr = (ip, porta)
+        print(f"[TESTE UDP] Enviando pacote de teste para {addr}")
+        
+        # Envia um pacote de teste
+        enviar_pacote(addr, 99, b'TESTE_UDP')
+        
+        return True
+    except Exception as e:
+        print(f"[ERRO TESTE UDP] {e}")
+        return False
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso: python p2p_udp.py <porta>")
@@ -869,15 +1005,28 @@ if __name__ == "__main__":
 
     PORTA_LOCAL = int(sys.argv[1])
 
-    # Garante que a pasta existe
-    if not os.path.exists(PASTA):
+    # Imprime informações sobre o ambiente
+    print(f"[INFO] Diretório de trabalho atual: {os.getcwd()}")
+    print(f"[INFO] Pasta compartilhada: {PASTA}")
+
+    # Garante que a pasta existe com exist_ok=True
+    try:
+        os.makedirs(PASTA, exist_ok=True)
+        print(f"[VERIFICADO] Pasta '{NOME_PASTA}' em: {PASTA}")
+        print(f"[DEBUG] Pasta existe? {os.path.exists(PASTA)}")
+        print(f"[DEBUG] Pasta tem permissão de escrita? {os.access(PASTA, os.W_OK)}")
+        
+        # Testa a escrita na pasta
+        test_file = os.path.join(PASTA, "test_write.txt")
         try:
-            os.makedirs(PASTA)
-            print(f"[CRIADO] Pasta '{NOME_PASTA}' criada em: {PASTA}")
+            with open(test_file, "w") as f:
+                f.write("Teste de escrita")
+            print(f"[DEBUG] Teste de escrita bem-sucedido: {os.path.exists(test_file)}")
+            os.remove(test_file)
         except Exception as e:
-            print(f"[ERRO] Não foi possível criar a pasta: {str(e)}")
-    else:
-        print(f"[EXISTE] Pasta encontrada: {PASTA}")
+            print(f"[ERRO] Falha no teste de escrita: {str(e)}")
+    except Exception as e:
+        print(f"[ERRO] Problema com a pasta: {str(e)}")
 
     # Inicia o socket UDP
     iniciar_udp_socket(PORTA_LOCAL)
@@ -916,6 +1065,7 @@ if __name__ == "__main__":
             print("5. Listar arquivos locais")
             print("6. Mostrar peers conectados")
             print("7. Sair")
+            print("8. Testar conexão UDP")
             escolha = input("Escolha uma opção: ")
 
             if escolha == "1":
@@ -926,51 +1076,53 @@ if __name__ == "__main__":
                     executar_na_dht(dht_node.bootstrap([(ip, porta + 1000)]))
             
             elif escolha == "2":
-                nome_arquivo = input("Nome do arquivo para buscar: ")
+                nome_arquivo = input("Nome do arquivo a procurar: ")
                 resultado = executar_na_dht(verificar_arquivo_na_dht(nome_arquivo))
                 if resultado:
-                    print(f"[ENCONTRADO] Arquivo '{nome_arquivo}':")
-                    print(f"  Timestamp: {time.ctime(resultado['timestamp'])}")
-                    print(f"  Hash: {resultado['hash']}")
+                    print(f"[DHT] Arquivo '{nome_arquivo}' encontrado na DHT:")
+                    print(f"  - Timestamp: {time.ctime(resultado['timestamp'])}")
+                    print(f"  - Hash: {resultado['hash']}")
                 else:
-                    print("[NÃO ENCONTRADO] Nenhum peer possui esse arquivo na DHT.")
+                    print(f"[DHT] Arquivo '{nome_arquivo}' não encontrado na DHT")
             
             elif escolha == "3":
                 if not peers:
-                    print("Não há peers conectados.")
-                else:
-                    print("Peers conectados:")
-                    for i, addr in enumerate(peers.keys()):
-                        print(f"{i+1}. {addr[0]}:{addr[1]}")
+                    print("[AVISO] Não há peers conectados.")
+                    continue
                     
-                    try:
-                        idx = int(input("Escolha um peer (número): ")) - 1
-                        if 0 <= idx < len(peers):
-                            addr = list(peers.keys())[idx]
-                            solicitar_lista_arquivos(addr)
-                        else:
-                            print("Índice inválido.")
-                    except ValueError:
-                        print("Entrada inválida.")
+                print("Peers disponíveis:")
+                for i, addr in enumerate(peers.keys()):
+                    print(f"{i+1}. {addr[0]}:{addr[1]}")
+                    
+                try:
+                    idx = int(input("Escolha um peer (número): ")) - 1
+                    if 0 <= idx < len(peers):
+                        addr = list(peers.keys())[idx]
+                        solicitar_lista_arquivos(addr)
+                    else:
+                        print("[ERRO] Índice inválido.")
+                except ValueError:
+                    print("[ERRO] Entrada inválida.")
             
             elif escolha == "4":
                 if not peers:
-                    print("Não há peers conectados.")
-                else:
-                    print("Peers conectados:")
-                    for i, addr in enumerate(peers.keys()):
-                        print(f"{i+1}. {addr[0]}:{addr[1]}")
+                    print("[AVISO] Não há peers conectados.")
+                    continue
                     
-                    try:
-                        idx = int(input("Escolha um peer (número): ")) - 1
-                        if 0 <= idx < len(peers):
-                            addr = list(peers.keys())[idx]
-                            nome_arquivo = input("Nome do arquivo a solicitar: ")
-                            solicitar_arquivo(addr, nome_arquivo)
-                        else:
-                            print("Índice inválido.")
-                    except ValueError:
-                        print("Entrada inválida.")
+                print("Peers disponíveis:")
+                for i, addr in enumerate(peers.keys()):
+                    print(f"{i+1}. {addr[0]}:{addr[1]}")
+                    
+                try:
+                    idx = int(input("Escolha um peer (número): ")) - 1
+                    if 0 <= idx < len(peers):
+                        addr = list(peers.keys())[idx]
+                        nome_arquivo = input("Nome do arquivo a solicitar: ")
+                        solicitar_arquivo(addr, nome_arquivo)
+                    else:
+                        print("[ERRO] Índice inválido.")
+                except ValueError:
+                    print("[ERRO] Entrada inválida.")
             
             elif escolha == "5":
                 arquivos = listar_arquivos_locais()
@@ -987,6 +1139,25 @@ if __name__ == "__main__":
             elif escolha == "7":
                 print("Encerrando...")
                 break
+                
+            elif escolha == "8":
+                if not peers:
+                    print("[AVISO] Não há peers conectados.")
+                    continue
+                    
+                print("Peers disponíveis:")
+                for i, addr in enumerate(peers.keys()):
+                    print(f"{i+1}. {addr[0]}:{addr[1]}")
+                    
+                try:
+                    idx = int(input("Escolha um peer (número): ")) - 1
+                    if 0 <= idx < len(peers):
+                        addr = list(peers.keys())[idx]
+                        testar_conexao_udp(addr[0], addr[1])
+                    else:
+                        print("[ERRO] Índice inválido.")
+                except ValueError:
+                    print("[ERRO] Entrada inválida.")
             
             else:
                 print("Opção inválida.")
