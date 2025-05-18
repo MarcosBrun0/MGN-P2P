@@ -105,37 +105,6 @@ def calcular_hash(dados):
     """
     return hashlib.md5(dados).hexdigest()
 
-def limpar_peers_inativos():
-    """
-    Remove peers inativos da lista global
-    """
-    global peers
-    agora = time.time()
-    
-    for addr in list(peers.keys()):
-        if agora - peers[addr].last_seen > 300:  # 5 minutos
-            print(f"[LIMPEZA] Peer {addr} removido por inatividade")
-            peers[addr].active = False
-            if addr in transfer_queues:
-                del transfer_queues[addr]
-            if addr in transfer_threads:
-                if transfer_threads[addr].is_alive():
-                    # Sinalizar para a thread parar
-                    pass
-                del transfer_threads[addr]
-            del peers[addr]
-    
-    print(f"[LIMPEZA] {len(peers)} peers ativos após limpeza")
-
-def iniciar_limpeza_periodica():
-    """
-    Inicia thread para limpeza periódica de peers inativos
-    """
-    global running
-    while running:
-        time.sleep(60)  # Verifica a cada minuto
-        limpar_peers_inativos()
-
 def get_external_ip():
     """
     Obtém o endereço IP externo e porta usando um servidor STUN
@@ -1042,9 +1011,6 @@ if __name__ == "__main__":
     # Inicia thread para receber pacotes
     recv_thread = threading.Thread(target=receber_pacotes, daemon=True)
     recv_thread.start()
-    
-    # Inicia thread para limpeza periódica de peers
-    threading.Thread(target=iniciar_limpeza_periodica, daemon=True).start()
     
     # Inicia thread para manter conexões ativas
     threading.Thread(target=manter_conexoes_ativas, daemon=True).start()
